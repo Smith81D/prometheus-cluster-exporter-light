@@ -1,0 +1,571 @@
+// -*- coding: utf-8 -*-
+//
+// © Copyright 2023 GSI Helmholtzzentrum für Schwerionenforschung
+//
+// This software is distributed under
+// the terms of the GNU General Public Licence version 3 (GPL Version 3),
+// copied verbatim in the file "LICENCE".
+
+package main
+
+import (
+	"errors"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/buger/jsonparser"
+	"github.com/prometheus/client_golang/prometheus"
+	log "github.com/sirupsen/logrus"
+)
+
+var regexMetadataMDT *regexp.Regexp = regexp.MustCompile(`^.*-MDT[[:xdigit:]]{4}$`)
+
+type exporter struct {
+	channelRunningJobs           chan runningJobsResult
+	channelUserInfo              chan userInfoMapResult
+	channelGroupInfo             chan groupInfoMapResult
+	scrapeActive                 bool
+	scrapeMutex                  sync.Mutex
+	requestTimeout               int
+	urlLustreMetadataOperations  string
+	urlLustreJobReadBytes        string
+	urlLustreJobWriteBytes       string
+	scrapeOKMetric               prometheus.Gauge
+	stageExecutionMetric         *prometheus.GaugeVec
+	jobMetadataOperationsMetric  *prometheus.GaugeVec
+	jobReadThroughputMetric      *prometheus.GaugeVec
+	jobWriteThroughputMetric     *prometheus.GaugeVec
+	procMetadataOperationsMetric *prometheus.GaugeVec
+	procReadThroughputMetric     *prometheus.GaugeVec
+	procWriteThroughputMetric    *prometheus.GaugeVec
+	runningSlurmJobsList         *prometheus.GaugeVec
+}
+
+type metadataInfo struct {
+	jobid      string
+	target     string
+	operations int64
+}
+
+type throughputInfo struct {
+	jobid      string
+	throughput float64
+}
+
+type procInfo struct {
+	procName  string
+	userName  string
+	groupName string
+}
+
+func newGaugeVecMetric(namespace string, metricName string, docString string, constLabels []string) *prometheus.GaugeVec {
+	return prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      metricName,
+			Help:      docString,
+		},
+		constLabels,
+	)
+}
+
+func newExporter(requestTimeout int, urlLustreMetadataOperations string, urlLustreJobReadBytes string, urlLustreJobWriteBytes string) *exporter {
+
+	if requestTimeout <= 0 {
+		log.Fatal("Request timeout must be greater then 0")
+	}
+
+	scrapeOKMetric := prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespaceInternals,
+		Name:      "scrape_ok",
+		Help:      "Indicates if the scrape of the exporter was successful or not.",
+	})
+
+	stageExecutionMetric := newGaugeVecMetric(
+		namespaceInternals,
+		"stage_execution_seconds",
+		"Execution duration in seconds spend in a specific exporter stage.",
+		[]string{"name"})
+
+	jobMetadataOperationsMetric := newGaugeVecMetric(
+		namespace,
+		"job_metadata_operations",
+		"Total metadata operations of all jobs per account and user on a target.",
+		[]string{"account", "user", "target"})
+
+	jobReadThroughputMetric := newGaugeVecMetric(
+		namespace,
+		"job_read_throughput_bytes",
+		"Total IO read throughput of all jobs per account and user in bytes per second.",
+		[]string{"account", "user"})
+
+	jobWriteThroughputMetric := newGaugeVecMetric(
+		namespace,
+		"job_write_throughput_bytes",
+		"Total IO write throughput of all jobs per account and user in bytes per second.",
+		[]string{"account", "user"})
+
+	procMetadataOperationsMetric := newGaugeVecMetric(
+		namespace,
+		"proc_metadata_operations",
+		"Total metadata operations of process names per group and user on a MDT.",
+		[]string{"proc_name", "group_name", "user_name", "target"})
+
+	procReadThroughputMetric := newGaugeVecMetric(
+		namespace,
+		"proc_read_throughput_bytes",
+		"Total IO read throughput of process names per group and user in bytes per second.",
+		[]string{"proc_name", "group_name", "user_name"})
+
+	procWriteThroughputMetric := newGaugeVecMetric(
+		namespace,
+		"proc_write_throughput_bytes",
+		"Total IO write throughput of process names per group and user in bytes per second.",
+		[]string{"proc_name", "group_name", "user_name"})
+
+	runningSlurmJobsList := newGaugeVecMetric(
+		namespace,
+		"running_slurm_jobs_list",
+		"Full list of jobs in the Slurm Queue.",
+		[]string{"job_id", "group_name", "user_name"})
+
+
+	return &exporter{
+		channelRunningJobs:           make(chan runningJobsResult),
+		channelUserInfo:              make(chan userInfoMapResult),
+		channelGroupInfo:             make(chan groupInfoMapResult),
+		requestTimeout:               requestTimeout,
+		urlLustreMetadataOperations:  urlLustreMetadataOperations,
+		urlLustreJobReadBytes:        urlLustreJobReadBytes,
+		urlLustreJobWriteBytes:       urlLustreJobWriteBytes,
+		scrapeOKMetric:               scrapeOKMetric,
+		stageExecutionMetric:         stageExecutionMetric,
+		jobMetadataOperationsMetric:  jobMetadataOperationsMetric,
+		jobReadThroughputMetric:      jobReadThroughputMetric,
+		jobWriteThroughputMetric:     jobWriteThroughputMetric,
+		procMetadataOperationsMetric: procMetadataOperationsMetric,
+		procReadThroughputMetric:     procReadThroughputMetric,
+		procWriteThroughputMetric:    procWriteThroughputMetric,
+		runningSlurmJobsList:	      runningSlurmJobsList,
+	}
+}
+
+func (e *exporter) Collect(ch chan<- prometheus.Metric) {
+
+	scrapeOK := true
+	var err error
+
+	e.scrapeMutex.Lock() // Do mutex unlock ASAP
+
+	if e.scrapeActive {
+		scrapeOK = false
+		log.Debug("Collect is still active... - Skipping now")
+		e.scrapeMutex.Unlock()
+	} else {
+		log.Debug("Collect started")
+
+		e.scrapeActive = true
+		e.scrapeMutex.Unlock()
+
+		var start time.Time
+		var elapsed float64
+
+		e.stageExecutionMetric.Reset()
+		e.jobMetadataOperationsMetric.Reset()
+		e.jobReadThroughputMetric.Reset()
+		e.jobWriteThroughputMetric.Reset()
+		e.procMetadataOperationsMetric.Reset()
+		e.procReadThroughputMetric.Reset()
+		e.procWriteThroughputMetric.Reset()
+		e.runningSlurmJobsList.Reset()
+
+		go retrieveRunningJobs(e.channelRunningJobs)
+		go createUserInfoMap(e.channelUserInfo)
+		go createGroupInfoMap(e.channelGroupInfo)
+
+		runningJobsResult := <-e.channelRunningJobs
+		userInfoResult := <-e.channelUserInfo
+		groupInfoResult := <-e.channelGroupInfo
+
+		for _, job := range runningJobsResult.jobs {
+			e.runningSlurmJobsList.WithLabelValues(job.jobid, job.account, job.user).Add(1)
+		}
+		
+		recordScrapeError("RunningJobsChannel", runningJobsResult.err, &scrapeOK)
+		recordScrapeError("UserInfoChannel", userInfoResult.err, &scrapeOK)
+		recordScrapeError("GroupInfoChannel", groupInfoResult.err, &scrapeOK)
+
+		e.stageExecutionMetric.WithLabelValues("retrieve_running_jobs").Set(runningJobsResult.elapsed)
+		e.stageExecutionMetric.WithLabelValues("retrieve_user_name_info").Set(userInfoResult.elapsed)
+		e.stageExecutionMetric.WithLabelValues("retrieve_group_name_info").Set(groupInfoResult.elapsed)
+
+		start = time.Now()
+		err = e.buildLustreMetadataMetrics(runningJobsResult.jobs, userInfoResult.users, groupInfoResult.groups)
+		elapsed = time.Since(start).Seconds()
+		e.stageExecutionMetric.WithLabelValues("build_metadata_metrics").Set(elapsed)
+		recordScrapeError("BuildMetadataMetrics", err, &scrapeOK)
+
+		start = time.Now()
+		err = e.buildLustreThroughputMetrics(runningJobsResult.jobs, userInfoResult.users, groupInfoResult.groups, true)
+		elapsed = time.Since(start).Seconds()
+		e.stageExecutionMetric.WithLabelValues("build_read_throughput_metrics").Set(elapsed)
+		recordScrapeError("BuildReadThroughputMetrics", err, &scrapeOK)
+
+		start = time.Now()
+		err = e.buildLustreThroughputMetrics(runningJobsResult.jobs, userInfoResult.users, groupInfoResult.groups, false)
+		elapsed = time.Since(start).Seconds()
+		e.stageExecutionMetric.WithLabelValues("build_write_throughput_metrics").Set(elapsed)
+		recordScrapeError("BuildWriteThroughputMetrics", err, &scrapeOK)
+
+		e.stageExecutionMetric.Collect(ch)
+		e.jobMetadataOperationsMetric.Collect(ch)
+		e.jobReadThroughputMetric.Collect(ch)
+		e.jobWriteThroughputMetric.Collect(ch)
+		e.procMetadataOperationsMetric.Collect(ch)
+		e.procReadThroughputMetric.Collect(ch)
+		e.procWriteThroughputMetric.Collect(ch)
+		e.runningSlurmJobsList.Collect(ch)
+
+		e.scrapeActive = false
+
+		log.Debug("Collect finished")
+	}
+
+	if scrapeOK {
+		e.scrapeOKMetric.Set(1)
+	} else {
+		e.scrapeOKMetric.Set(0)
+	}
+
+	e.scrapeOKMetric.Collect(ch)
+}
+
+func (e *exporter) Describe(ch chan<- *prometheus.Desc) {
+	e.scrapeOKMetric.Describe(ch)
+	e.stageExecutionMetric.Describe(ch)
+	e.jobMetadataOperationsMetric.Describe(ch)
+	e.jobReadThroughputMetric.Describe(ch)
+	e.jobWriteThroughputMetric.Describe(ch)
+	e.procMetadataOperationsMetric.Describe(ch)
+	e.procReadThroughputMetric.Describe(ch)
+	e.procWriteThroughputMetric.Describe(ch)
+	e.runningSlurmJobsList.Describe(ch)
+}
+
+func (e *exporter) buildLustreMetadataMetrics(jobs []jobInfo, users userInfoMap, groups groupInfoMap) error {
+
+	log.Debug("Process metadata operations")
+
+	if len(jobs) == 0 {
+		return errors.New("parameter jobs is not set")
+	}
+
+	if len(users) == 0 {
+		return errors.New("parameter users is not set")
+	}
+
+	if len(groups) == 0 {
+		return errors.New("parameter groups is not set")
+	}
+
+	content, err := httpRequest(e.urlLustreMetadataOperations, e.requestTimeout)
+	if err != nil {
+		return err
+	}
+
+	if log.IsLevelEnabled(log.TraceLevel) {
+		log.Trace("Bytes received: ", len(*content))
+	}
+
+	lustreMetadataOperations, err := parseLustreMetadataOperations(content)
+	if err != nil {
+		return err
+	}
+
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.Debug("Count Lustre Jobids with metadata operatons: ", len(*lustreMetadataOperations))
+	}
+
+	for _, metadataInfo := range *lustreMetadataOperations {
+
+		if isNumber(&metadataInfo.jobid) { // SLURM Job
+
+			for _, job := range jobs {
+				if metadataInfo.jobid == job.jobid {
+					e.jobMetadataOperationsMetric.WithLabelValues(job.account, job.user, metadataInfo.target).Add(
+						float64(metadataInfo.operations))
+				}
+			}
+
+		} else { // Should look like process name with UID (proc_name.uid)
+
+			info, err := resolveProcInfo(metadataInfo.jobid, users, groups)
+			if err != nil {
+				return err
+			}
+			if info == nil {
+				continue
+			}
+
+			e.procMetadataOperationsMetric.WithLabelValues(
+				info.procName, info.groupName, info.userName, metadataInfo.target).Add(float64(metadataInfo.operations))
+		}
+	}
+
+	return nil
+}
+
+func (e *exporter) buildLustreThroughputMetrics(jobs []jobInfo, users userInfoMap, groups groupInfoMap, read bool) error {
+
+	var url string
+	var jobMetric *prometheus.GaugeVec
+	var procMetric *prometheus.GaugeVec
+
+	if read {
+		log.Debug("Process read throughput")
+		url = e.urlLustreJobReadBytes
+		jobMetric = e.jobReadThroughputMetric
+		procMetric = e.procReadThroughputMetric
+	} else {
+		log.Debug("Process write throughput")
+		url = e.urlLustreJobWriteBytes
+		jobMetric = e.jobWriteThroughputMetric
+		procMetric = e.procWriteThroughputMetric
+	}
+
+	if len(jobs) == 0 {
+		return errors.New("parameter jobs is not set")
+	}
+
+	if len(users) == 0 {
+		return errors.New("parameter users is not set")
+	}
+
+	if len(groups) == 0 {
+		return errors.New("parameter groups is not set")
+	}
+
+	content, err := httpRequest(url, e.requestTimeout)
+	if err != nil {
+		return err
+	}
+
+	if log.IsLevelEnabled(log.TraceLevel) {
+		log.Trace("Bytes received: ", len(*content))
+	}
+
+	lustreThroughput, err := parseLustreTotalBytes(content)
+	if err != nil {
+		return err
+	}
+
+	if log.IsLevelEnabled(log.DebugLevel) {
+		log.Debug("Count Lustre Jobids with throughput: ", len(*lustreThroughput))
+	}
+
+	for _, thInfo := range *lustreThroughput {
+
+		if isNumber(&thInfo.jobid) { // SLURM Job
+
+			for _, job := range jobs {
+				if thInfo.jobid == job.jobid {
+					jobMetric.WithLabelValues(job.account, job.user).Add(thInfo.throughput)
+				}
+			}
+
+		} else { // Should look like process name with UID (proc_name.uid)
+
+			info, err := resolveProcInfo(thInfo.jobid, users, groups)
+			if err != nil {
+				return err
+			}
+			if info == nil {
+				continue
+			}
+
+			procMetric.WithLabelValues(info.procName, info.groupName, info.userName).Add(thInfo.throughput)
+		}
+	}
+
+	return nil
+}
+
+// resolveProcInfo parses a "procname.uid" jobid and resolves the UID to
+// user and group information via the provided lookup maps.
+// Returns (nil, nil) when the entry should be skipped (insufficient fields,
+// unknown UID or GID), and (nil, err) on fatal parse errors (malformed UID).
+func resolveProcInfo(jobid string, users userInfoMap, groups groupInfoMap) (*procInfo, error) {
+
+	fields := strings.Split(jobid, ".")
+	lenFields := len(fields)
+
+	if lenFields < 2 {
+		log.Warning("Insufficient Lustre Jobstats procname_uid fields found in jobid: ", jobid)
+		return nil, nil
+	}
+
+	// procName is all fields except the last, joined by "."
+	procName := strings.Join(fields[:lenFields-1], ".")
+	// uid is the last field
+	uid, err := strconv.Atoi(fields[lenFields-1])
+	if err != nil {
+		log.Warning("Failed to parse uid from fields: ", fields)
+		return nil, err
+	}
+
+	userInfo, ok := users[uid]
+	if !ok {
+		log.Warning("uid not found in users map: ", uid)
+		return nil, nil
+	}
+
+	groupInfo, ok := groups[userInfo.gid]
+	if !ok {
+		log.Warning("gid not found in groups map: ", userInfo.gid)
+		return nil, nil
+	}
+
+	return &procInfo{
+		procName:  procName,
+		userName:  userInfo.user,
+		groupName: groupInfo.group,
+	}, nil
+}
+
+func parseLustreMetadataOperations(content *[]byte) (*[]metadataInfo, error) {
+
+	log.Debug("Parsing Lustre metadata operations")
+
+	if log.IsLevelEnabled(log.TraceLevel) {
+		log.Trace(string(*content))
+	}
+
+	status, err := jsonparser.GetString(*content, "status")
+	if err != nil {
+		return nil, err
+	}
+	if status != "success" {
+		return nil, errors.New("value success not found in field status")
+	}
+
+	slice := make([]metadataInfo, 0, 1000)
+
+	jsonparser.ArrayEach(*content, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
+
+		var jobid string
+		var target string
+		var operations int64
+
+		jobid, err = jsonparser.GetString(value, "metric", "jobid")
+
+		if err != nil {
+			log.Warning("Key jobid not found in value: ", string(value))
+			return
+		}
+		if jobid == "" {
+			log.Warning("Jobid is empty in value: ", string(value))
+			return
+		}
+
+		// TODO: Should be possible to avoid calling GetString multiple times?
+		operationsStr, err := jsonparser.GetString(value, "value", "[1]")
+		if err != nil {
+			log.Warning(err)
+			return
+		}
+
+		operations, err = strconv.ParseInt(operationsStr, 10, 64)
+		if err != nil {
+			log.Warning(err)
+			return
+		}
+
+		target, err = jsonparser.GetString(value, "metric", "target")
+		if err != nil {
+			log.Warning("Key target not found in value:", string(value))
+			return
+		}
+
+		if target == "" {
+			log.Warning("Target is empty in value:", string(value))
+			return
+		}
+
+		if !regexMetadataMDT.MatchString(target) {
+			if log.IsLevelEnabled(log.DebugLevel) {
+				log.Debug("Skipped metadata operation for non-MDT target: ", string(value))
+			}
+			return
+		}
+
+		slice = append(slice, metadataInfo{jobid, target, operations})
+
+	}, "data", "result")
+
+	return &slice, nil
+}
+
+func parseLustreTotalBytes(content *[]byte) (*[]throughputInfo, error) {
+
+	log.Debug("Parsing Lustre total bytes")
+
+	if log.IsLevelEnabled(log.TraceLevel) {
+		log.Trace(string(*content))
+	}
+
+	status, err := jsonparser.GetString(*content, "status")
+	if err != nil {
+		return nil, err
+	}
+	if status != "success" {
+		return nil, errors.New("value success not found in field status")
+	}
+
+	slice := make([]throughputInfo, 0, 1000)
+
+	jsonparser.ArrayEach(*content, func(value []byte, dataType jsonparser.ValueType, offset int, err error) {
+
+		jobid, err := jsonparser.GetString(value, "metric", "jobid")
+
+		if err != nil {
+			log.Warning("Key jobid not found in value: ", string(value))
+			return
+		}
+
+		throughputStr, err := jsonparser.GetString(value, "value", "[1]")
+		if err != nil {
+			log.Warning(err)
+			return
+		}
+
+		throughput, err := strconv.ParseFloat(throughputStr, 64)
+		if err != nil {
+			log.Warning(err)
+			return
+		}
+
+		slice = append(slice, throughputInfo{jobid, throughput})
+
+	}, "data", "result")
+
+	return &slice, nil
+}
+
+func isNumber(input *string) bool {
+	if _, err := strconv.Atoi(*input); err != nil {
+		return false
+	}
+	return true
+}
+
+func recordScrapeError(sender string, err error, scrapeOK *bool) {
+	if err != nil {
+		log.Errorln(sender, ": ", err)
+		if scrapeOK != nil {
+			*scrapeOK = false
+		}
+	}
+}
