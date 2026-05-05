@@ -80,49 +80,49 @@ func newExporter(requestTimeout int, urlLustreMetadataOperations string, urlLust
 
 	scrapeOKMetric := prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespaceInternals,
-		Name:      "scrape_ok",
+		Name:      "light_scrape_ok",
 		Help:      "Indicates if the scrape of the exporter was successful or not.",
 	})
 
 	stageExecutionMetric := newGaugeVecMetric(
 		namespaceInternals,
-		"stage_execution_seconds",
+		"light_stage_execution_seconds",
 		"Execution duration in seconds spend in a specific exporter stage.",
 		[]string{"name"})
 
 	jobMetadataOperationsMetric := newGaugeVecMetric(
 		namespace,
-		"job_metadata_operations",
+		"light_job_metadata_operations",
 		"Total metadata operations of all jobs per account and user on a target.",
 		[]string{"account", "user", "target"})
 
 	jobReadThroughputMetric := newGaugeVecMetric(
 		namespace,
-		"job_read_throughput_bytes",
+		"light_job_read_throughput_bytes",
 		"Total IO read throughput of all jobs per account and user in bytes per second.",
 		[]string{"account", "user"})
 
 	jobWriteThroughputMetric := newGaugeVecMetric(
 		namespace,
-		"job_write_throughput_bytes",
+		"light_job_write_throughput_bytes",
 		"Total IO write throughput of all jobs per account and user in bytes per second.",
 		[]string{"account", "user"})
 
 	procMetadataOperationsMetric := newGaugeVecMetric(
 		namespace,
-		"proc_metadata_operations",
+		"light_proc_metadata_operations",
 		"Total metadata operations of process names per group and user on a MDT.",
 		[]string{"proc_name", "group_name", "user_name", "target"})
 
 	procReadThroughputMetric := newGaugeVecMetric(
 		namespace,
-		"proc_read_throughput_bytes",
+		"light_proc_read_throughput_bytes",
 		"Total IO read throughput of process names per group and user in bytes per second.",
 		[]string{"proc_name", "group_name", "user_name"})
 
 	procWriteThroughputMetric := newGaugeVecMetric(
 		namespace,
-		"proc_write_throughput_bytes",
+		"light_proc_write_throughput_bytes",
 		"Total IO write throughput of process names per group and user in bytes per second.",
 		[]string{"proc_name", "group_name", "user_name"})
 
@@ -130,7 +130,7 @@ func newExporter(requestTimeout int, urlLustreMetadataOperations string, urlLust
 		namespace,
 		"running_slurm_jobs_list",
 		"Full list of jobs in the Slurm Queue.",
-		[]string{"job_id", "group_name", "user_name"})
+		[]string{"jobid", "group_name", "user_name"})
 
 
 	return &exporter{
