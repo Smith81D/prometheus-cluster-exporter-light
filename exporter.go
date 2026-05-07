@@ -66,7 +66,7 @@ func newExporter(requestTimeout int, urlLustreMetadataOperations string, urlLust
 
 	userInfoList := newGaugeVecMetric(
 		namespace,
-		"user_info_list_list",
+		"user_info_list",
 		"Full list of users.",
 		[]string{"uid", "user_name", "group_name"})
 
@@ -142,6 +142,7 @@ func (e *exporter) Describe(ch chan<- *prometheus.Desc) {
 	e.scrapeOKMetric.Describe(ch)
 	e.stageExecutionMetric.Describe(ch)
 	e.runningSlurmJobsList.Describe(ch)
+	e.userInfoList.Describe(ch)
 }
 
 func recordScrapeError(sender string, err error, scrapeOK *bool) {
