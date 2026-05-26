@@ -62,7 +62,7 @@ func newExporter(requestTimeout int, urlLustreMetadataOperations string, urlLust
 		namespace,
 		"running_slurm_jobs_list",
 		"Full list of jobs in the Slurm Queue.",
-		[]string{"jobid", "group_name", "user_name"})
+		[]string{"jobid", "slurm_account", "user_name"})
 
 	userInfoList := newGaugeVecMetric(
 		namespace,
